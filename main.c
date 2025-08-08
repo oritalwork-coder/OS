@@ -7,7 +7,10 @@
 #include <unistd.h>
 #include <limits.h>
 
-// Function pointer types for plugin interface
+/**
+ * Function pointer types for plugin interface
+ * These match the plugin SDK exactly
+ */
 typedef const char* (*plugin_get_name_func_t)(void);
 typedef const char* (*plugin_init_func_t)(int);
 typedef const char* (*plugin_fini_func_t)(void);
@@ -15,13 +18,17 @@ typedef const char* (*plugin_place_work_func_t)(const char*);
 typedef void (*plugin_attach_func_t)(const char* (*)(const char*));
 typedef const char* (*plugin_wait_finished_func_t)(void);
 
-// Plugin handle structure - exactly as specified in the assignment
+/**
+ * Plugin handle structure
+ * Contains all function pointers and metadata for a loaded plugin
+ */
 typedef struct {
     plugin_init_func_t init;
     plugin_fini_func_t fini;
     plugin_place_work_func_t place_work;
     plugin_attach_func_t attach;
     plugin_wait_finished_func_t wait_finished;
+    plugin_get_name_func_t get_name;
     char* name;
     void* handle;
 } plugin_handle_t;
@@ -31,7 +38,8 @@ static plugin_handle_t* plugins = NULL;
 static int plugin_count = 0;
 
 /**
- * Print usage information to stdout (as required by assignment)
+ * Print usage information to stdout
+ * Called when there are argument errors or help is needed
  */
 void print_usage(void) {
     printf("Usage: ./analyzer <queue_size> <plugin1> <plugin2> ... <pluginN>\n");
@@ -92,11 +100,13 @@ void cleanup_plugins(int loaded_count, int initialized_count) {
 
 /**
  * Load a plugin from a shared object file
+ * IMPORTANT: For repeated plugins, we use RTLD_LOCAL to ensure separate instances
  * @param plugin_name Name of the plugin (without .so extension)
  * @param handle Pointer to plugin_handle_t to fill
+ * @param instance_num Instance number for this plugin type (for unique naming)
  * @return 0 on success, -1 on failure
  */
-int load_plugin(const char* plugin_name, plugin_handle_t* handle) {
+int load_plugin(const char* plugin_name, plugin_handle_t* handle, int instance_num) {
     if (!plugin_name || !handle) {
         fprintf(stderr, "[ERROR] Invalid parameters to load_plugin\n");
         return -1;
@@ -105,8 +115,10 @@ int load_plugin(const char* plugin_name, plugin_handle_t* handle) {
     // Clear the handle structure
     memset(handle, 0, sizeof(plugin_handle_t));
     
-    // Store the plugin name first
-    handle->name = strdup(plugin_name);
+    // Store the plugin name with instance number if needed
+    char name_with_instance[256];
+    snprintf(name_with_instance, sizeof(name_with_instance), "%s_%d", plugin_name, instance_num);
+    handle->name = strdup(name_with_instance);
     if (!handle->name) {
         fprintf(stderr, "[ERROR] Failed to allocate memory for plugin name\n");
         return -1;
@@ -116,13 +128,72 @@ int load_plugin(const char* plugin_name, plugin_handle_t* handle) {
     char filename[256];
     snprintf(filename, sizeof(filename), "./output/%s.so", plugin_name);
     
-    // Load the shared object with RTLD_NOW | RTLD_LOCAL as specified
+    // CRITICAL: For repeated plugins, we need to create separate copies
+    // of the shared object to avoid static variable conflicts
+    char temp_filename[256];
+    int needs_copy = 0;
+    
+    // Check if this plugin was already loaded
+    for (int i = 0; i < instance_num; i++) {
+        if (plugins[i].handle && strncmp(plugins[i].name, plugin_name, strlen(plugin_name)) == 0) {
+            needs_copy = 1;
+            break;
+        }
+    }
+    
+    if (needs_copy) {
+        // Create a temporary copy of the .so file for this instance
+        snprintf(temp_filename, sizeof(temp_filename), "./output/.%s_%d_%d.so", 
+                 plugin_name, getpid(), instance_num);
+        
+        // Copy the original .so to a temporary file
+        FILE* src = fopen(filename, "rb");
+        if (!src) {
+            fprintf(stderr, "[ERROR] Failed to open source plugin %s\n", filename);
+            free(handle->name);
+            handle->name = NULL;
+            return -1;
+        }
+        
+        FILE* dst = fopen(temp_filename, "wb");
+        if (!dst) {
+            fprintf(stderr, "[ERROR] Failed to create temp plugin copy\n");
+            fclose(src);
+            free(handle->name);
+            handle->name = NULL;
+            return -1;
+        }
+        
+        // Copy file content
+        char buffer[4096];
+        size_t bytes;
+        while ((bytes = fread(buffer, 1, sizeof(buffer), src)) > 0) {
+            fwrite(buffer, 1, bytes, dst);
+        }
+        
+        fclose(src);
+        fclose(dst);
+        
+        // Make the temp file executable
+        chmod(temp_filename, 0755);
+        
+        // Use the temp file for loading
+        strcpy(filename, temp_filename);
+    }
+    
+    // Load the shared object with RTLD_NOW | RTLD_LOCAL
+    // RTLD_LOCAL is crucial - it ensures symbols don't conflict between instances
     handle->handle = dlopen(filename, RTLD_NOW | RTLD_LOCAL);
     if (!handle->handle) {
         fprintf(stderr, "[ERROR] Failed to load plugin %s: %s\n", 
                 plugin_name, dlerror());
         free(handle->name);
         handle->name = NULL;
+        
+        // Clean up temp file if created
+        if (needs_copy) {
+            unlink(filename);
+        }
         return -1;
     }
     
@@ -137,6 +208,7 @@ int load_plugin(const char* plugin_name, plugin_handle_t* handle) {
         dlclose(handle->handle);
         free(handle->name);
         handle->name = NULL;
+        if (needs_copy) unlink(filename);
         return -1;
     }
     
@@ -147,6 +219,7 @@ int load_plugin(const char* plugin_name, plugin_handle_t* handle) {
         dlclose(handle->handle);
         free(handle->name);
         handle->name = NULL;
+        if (needs_copy) unlink(filename);
         return -1;
     }
     
@@ -157,6 +230,7 @@ int load_plugin(const char* plugin_name, plugin_handle_t* handle) {
         dlclose(handle->handle);
         free(handle->name);
         handle->name = NULL;
+        if (needs_copy) unlink(filename);
         return -1;
     }
     
@@ -167,6 +241,7 @@ int load_plugin(const char* plugin_name, plugin_handle_t* handle) {
         dlclose(handle->handle);
         free(handle->name);
         handle->name = NULL;
+        if (needs_copy) unlink(filename);
         return -1;
     }
     
@@ -177,13 +252,38 @@ int load_plugin(const char* plugin_name, plugin_handle_t* handle) {
         dlclose(handle->handle);
         free(handle->name);
         handle->name = NULL;
+        if (needs_copy) unlink(filename);
         return -1;
     }
+    
+    handle->get_name = (plugin_get_name_func_t)dlsym(handle->handle, "plugin_get_name");
+    // get_name is optional, don't fail if not found
     
     return 0;
 }
 
+/**
+ * Clean up temporary .so files created for repeated plugins
+ */
+void cleanup_temp_files(void) {
+    // Clean up any temporary .so files we created
+    char pattern[256];
+    snprintf(pattern, sizeof(pattern), "./output/.%d_*.so", getpid());
+    
+    // Use glob to find matching files (if available)
+    // For simplicity, we'll just try to unlink known temp files
+    for (int i = 0; i < plugin_count; i++) {
+        char temp_file[256];
+        snprintf(temp_file, sizeof(temp_file), "./output/.%s_%d.so", 
+                 plugins[i].name, getpid());
+        unlink(temp_file); // Ignore errors - file might not exist
+    }
+}
+
 int main(int argc, char* argv[]) {
+    // Register cleanup function for temp files
+    atexit(cleanup_temp_files);
+    
     // Step 1: Parse Command-Line Arguments
     if (argc < 3) {
         fprintf(stderr, "[ERROR] Insufficient arguments\n");
@@ -194,6 +294,13 @@ int main(int argc, char* argv[]) {
     // Parse queue size - must be a positive integer
     char* endptr;
     long queue_size_long = strtol(argv[1], &endptr, 10);
+    
+    // Validate queue size - check for leading zeros
+    if (argv[1][0] == '0' && strlen(argv[1]) > 1) {
+        fprintf(stderr, "[ERROR] Invalid queue size: %s (must be a positive integer)\n", argv[1]);
+        print_usage();
+        return 1;
+    }
     
     // Validate queue size
     if (*endptr != '\0' || queue_size_long <= 0 || queue_size_long > INT_MAX) {
@@ -222,7 +329,7 @@ int main(int argc, char* argv[]) {
     // Step 2: Load Plugin Shared Objects
     int loaded_count = 0;
     for (int i = 0; i < plugin_count; i++) {
-        if (load_plugin(argv[i + 2], &plugins[i]) != 0) {
+        if (load_plugin(argv[i + 2], &plugins[i], i) != 0) {
             // On any failure: print error to stderr, print usage to stdout, exit with code 1
             print_usage();
             cleanup_plugins(loaded_count, 0);
@@ -238,7 +345,7 @@ int main(int argc, char* argv[]) {
         if (err) {
             // If plugin fails to initialize: stop, clean up, print error, exit with code 2
             fprintf(stderr, "[ERROR] Failed to initialize plugin %s: %s\n", 
-                    plugins[i].name, err);
+                    argv[i + 2], err);  // Use original name for error message
             cleanup_plugins(loaded_count, initialized_count);
             return 2;  // Exit code 2 for plugin initialization failure
         }
@@ -294,7 +401,7 @@ int main(int argc, char* argv[]) {
         const char* err = plugins[i].wait_finished();
         if (err) {
             fprintf(stderr, "[ERROR] Failed waiting for plugin %s to finish: %s\n", 
-                    plugins[i].name, err);
+                    argv[i + 2], err);  // Use original name for error message
             // Continue waiting for other plugins - don't exit early
         }
     }
